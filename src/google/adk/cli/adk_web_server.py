@@ -32,7 +32,9 @@ from typing import Literal
 from typing import Optional
 
 from fastapi import FastAPI
+from fastapi import Body
 from fastapi import HTTPException
+from fastapi import Path
 from fastapi import Query
 from fastapi import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -355,32 +357,102 @@ class InMemoryExporter(export_lib.SpanExporter):
 
 
 class RunAgentRequest(common.BaseModel):
-  app_name: str
-  user_id: str
-  session_id: str
-  new_message: Optional[types.Content] = None
-  streaming: bool = False
-  state_delta: Optional[dict[str, Any]] = None
+  """Request payload for invoking an agent run."""
+
+  app_name: str = Field(
+      description="Application name to run.",
+      examples=["hello_world"],
+  )
+  user_id: str = Field(
+      description="User ID whose session is used for the run.",
+      examples=["user-123"],
+  )
+  session_id: str = Field(
+      description=(
+          "Session ID to run against. The session must already exist unless"
+          " the server was configured with auto_create_session=True."
+      ),
+      examples=["session-abc123"],
+  )
+  new_message: Optional[types.Content] = Field(
+      default=None,
+      description=(
+          "Optional user message to append before the run starts. Either"
+          " new_message or invocation_id is required for a run."
+      ),
+      examples=[
+          {
+              "role": "user",
+              "parts": [{"text": "Summarize the last response."}],
+          }
+      ],
+  )
+  streaming: bool = Field(
+      default=False,
+      description=(
+          "When true, /run_sse emits server-sent events as they are produced."
+          " This flag has no effect on the non-streaming /run endpoint."
+      ),
+      examples=[True],
+  )
+  state_delta: Optional[dict[str, Any]] = Field(
+      default=None,
+      description=(
+          "Optional session state changes to apply before the agent run."
+      ),
+      examples=[{"locale": "en-US"}],
+  )
   # for long-running function resume requests (e.g., OAuth callback)
-  function_call_event_id: Optional[str] = None
+  function_call_event_id: Optional[str] = Field(
+      default=None,
+      description=(
+          "Function call event being resumed. Used by /run_sse to avoid"
+          " splitting artifact updates into duplicate content and action"
+          " events during resume flows."
+      ),
+      examples=["event-123"],
+  )
   # for resume long-running functions
-  invocation_id: Optional[str] = None
+  invocation_id: Optional[str] = Field(
+      default=None,
+      description=(
+          "Invocation ID to resume. When provided without new_message, the"
+          " runner resumes a prior resumable invocation."
+      ),
+      examples=["invocation-123"],
+  )
 
 
 class CreateSessionRequest(common.BaseModel):
+  """Request payload for creating a new session.
+
+  Attributes:
+      session_id: The ID of the session to create. If omitted, a random ID is
+          generated automatically.
+      state: An optional key-value mapping used as the session's initial state.
+      events: An optional list of events to seed the session history with.
+  """
+
   session_id: Optional[str] = Field(
       default=None,
       description=(
           "The ID of the session to create. If not provided, a random session"
           " ID will be generated."
       ),
+      examples=["session-abc123"],
   )
   state: Optional[dict[str, Any]] = Field(
-      default=None, description="The initial state of the session."
+      default=None,
+      description="The initial state of the session.",
+      examples=[{"user_preferences": {"language": "en"}}],
   )
   events: Optional[list[Event]] = Field(
       default=None,
-      description="A list of events to initialize the session with.",
+      description=(
+          "Optional list of events to seed the session history. Events are"
+          " appended in order after session creation."
+      ),
+      examples=[[]],
   )
 
 
@@ -429,7 +501,10 @@ class UpdateMemoryRequest(common.BaseModel):
 class UpdateSessionRequest(common.BaseModel):
   """Request to update session state without running the agent."""
 
-  state_delta: dict[str, Any]
+  state_delta: dict[str, Any] = Field(
+      description="State changes to merge into the existing session state.",
+      examples=[{"locale": "en-US"}],
+  )
   """The state changes to apply to the session."""
 
 
@@ -908,7 +983,15 @@ class AdkWebServer:
     register_processors(tracer_provider)
 
     # Run the FastAPI server.
-    app = FastAPI(lifespan=internal_lifespan)
+    app = FastAPI(
+        title="ADK Web Server API",
+        description=(
+            "REST API for managing ADK applications, sessions, artifacts, and"
+            " agent runs."
+        ),
+        version=__version__,
+        lifespan=internal_lifespan,
+    )
 
     has_configured_allowed_origins = bool(allow_origins)
     if allow_origins:
@@ -935,12 +1018,45 @@ class AdkWebServer:
         allowed_origin_regex=compiled_origin_regex,
     )
 
-    @app.get("/health")
+    @app.get(
+        "/health",
+        summary="Health check",
+        response_description="Basic liveness check for the API server.",
+        responses={
+            500: {"description": "Internal server error."},
+        },
+    )
     async def health() -> dict[str, str]:
+      """Check whether the API server is running.
+
+      **Returns**
+      - `dict[str, str]`: A small status payload.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       return {"status": "ok"}
 
-    @app.get("/version")
+    @app.get(
+        "/version",
+        summary="Get version information",
+        response_description="Version information for ADK and Python runtime.",
+        responses={
+            500: {"description": "Internal server error."},
+        },
+    )
     async def version() -> dict[str, str]:
+      """Return version information for the server runtime.
+
+      **Returns**
+      - `dict[str, str]`: Version metadata containing:
+        - `version`: ADK package version.
+        - `language`: Always `python`.
+        - `language_version`: Python runtime version.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       return {
           "version": __version__,
           "language": "python",
@@ -949,12 +1065,35 @@ class AdkWebServer:
           ),
       }
 
-    @app.get("/list-apps")
+    @app.get(
+        "/list-apps",
+        response_model_exclude_none=True,
+        summary="List available apps",
+        response_description=(
+            "Either a list of app names, or detailed app information when"
+            " detailed=true."
+        ),
+        responses={
+            500: {"description": "Internal server error."},
+        },
+    )
     async def list_apps(
         detailed: bool = Query(
             default=False, description="Return detailed app information"
         )
     ) -> list[str] | ListAppsResponse:
+      """List the apps available to the server.
+
+      **Query parameters**
+      - `detailed` (optional): When true, returns structured app metadata.
+
+      **Returns**
+      - `list[str]`: App names when `detailed` is false.
+      - `ListAppsResponse`: App metadata when `detailed` is true.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       if detailed:
         apps_info = self.agent_loader.list_agents_detailed()
         return ListAppsResponse(apps=[AppInfo(**app) for app in apps_info])
@@ -1076,10 +1215,47 @@ class AdkWebServer:
     @app.get(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
         response_model_exclude_none=True,
+        summary="Get a session",
+        response_description=(
+            "The stored session, including its current state and event"
+            " history."
+        ),
+        responses={
+            404: {"description": "Session not found."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def get_session(
-        app_name: str, user_id: str, session_id: str
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID to retrieve.",
+            examples=["session-abc123"],
+        ),
     ) -> Session:
+      """Retrieve a specific session by ID.
+
+      Returns the full session object, including conversation history and
+      state, for the given application, user, and session ID.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Unique identifier of the session to retrieve.
+
+      **Returns**
+      - `Session`: Session object containing conversation events and state.
+
+      **Errors**
+      - `404 Not Found`: No session exists with the given ID.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       session = await self.session_service.get_session(
           app_name=app_name, user_id=user_id, session_id=session_id
       )
@@ -1091,8 +1267,41 @@ class AdkWebServer:
     @app.get(
         "/apps/{app_name}/users/{user_id}/sessions",
         response_model_exclude_none=True,
+        summary="List sessions",
+        response_description=(
+            "All non-evaluation sessions for the specified application and"
+            " user."
+        ),
+        responses={
+            500: {"description": "Internal server error."},
+        },
     )
-    async def list_sessions(app_name: str, user_id: str) -> list[Session]:
+    async def list_sessions(
+        app_name: str = Path(
+            description="Application name to list sessions from.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID whose sessions are listed.",
+            examples=["user-123"],
+        ),
+    ) -> list[Session]:
+      """List sessions for a user in an application.
+
+      Returns all sessions for the given application and user, excluding
+      internal sessions generated during evaluation runs.
+
+      **Path parameters**
+      - `app_name`: Name of the application.
+      - `user_id`: ID of the user whose sessions are listed.
+
+      **Returns**
+      - `list[Session]`: List of sessions. Returns an empty list when none
+        exist.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       list_sessions_response = await self.session_service.list_sessions(
           app_name=app_name, user_id=user_id
       )
@@ -1110,13 +1319,58 @@ class AdkWebServer:
     @app.post(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
         response_model_exclude_none=True,
+        summary="Create a session (deprecated)",
+        response_description="The newly created session.",
+        responses={
+            409: {"description": "Session already exists."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def create_session_with_id(
-        app_name: str,
-        user_id: str,
-        session_id: str,
-        state: Optional[dict[str, Any]] = None,
+        app_name: str = Path(
+            description=(
+                "Application name under which the session is created."
+            ),
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID for whom the session is created.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID to create.",
+            examples=["session-abc123"],
+        ),
+        state: Optional[dict[str, Any]] = Body(
+            default=None,
+            description=(
+                "Optional initial state for the session. Prefer using"
+                " create_session with a request body."
+            ),
+            examples=[{"locale": "en-US"}],
+        ),
     ) -> Session:
+      """Create a new session with an explicit session_id (deprecated).
+
+      Prefer `create_session`, which uses a structured request body and can
+      seed events. This route exists for backward compatibility and will be
+      removed in a future release.
+
+      **Path parameters**
+      - `app_name`: Name of the application where the session is created.
+      - `user_id`: ID of the user for whom the session is created.
+      - `session_id`: Explicit session ID to create.
+
+      **Request body**
+      - `state` (optional): Initial session state.
+
+      **Returns**
+      - `Session`: Newly created session object.
+
+      **Errors**
+      - `409 Conflict`: Session with the same ID already exists.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       return await self._create_session(
           app_name=app_name,
           user_id=user_id,
@@ -1127,12 +1381,51 @@ class AdkWebServer:
     @app.post(
         "/apps/{app_name}/users/{user_id}/sessions",
         response_model_exclude_none=True,
+        summary="Create a session",
+        response_description=(
+            "The newly created session with its initial state and any seeded"
+            " events."
+        ),
+        responses={
+            409: {"description": "Session already exists."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def create_session(
-        app_name: str,
-        user_id: str,
+        app_name: str = Path(
+            description=(
+                "Application name under which the session is created."
+            ),
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID for whom the session is created.",
+            examples=["user-123"],
+        ),
         req: Optional[CreateSessionRequest] = None,
     ) -> Session:
+      """Create a new session for a user in an application.
+
+      A session stores conversation history and state across agent
+      interactions. If `req.session_id` is omitted, a random session ID is
+      generated automatically.
+
+      **Path parameters**
+      - `app_name`: Name of the application where the session is created.
+      - `user_id`: ID of the user for whom the session is created.
+
+      **Request body**
+      - `req.session_id` (optional): Explicit session ID.
+      - `req.state` (optional): Initial session state.
+      - `req.events` (optional): Seed events appended after creation.
+
+      **Returns**
+      - `Session`: Newly created session object.
+
+      **Errors**
+      - `409 Conflict`: Session with the same ID already exists.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       if not req:
         return await self._create_session(app_name=app_name, user_id=user_id)
 
@@ -1149,10 +1442,41 @@ class AdkWebServer:
 
       return session
 
-    @app.delete("/apps/{app_name}/users/{user_id}/sessions/{session_id}")
+    @app.delete(
+        "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
+        summary="Delete a session",
+        response_description="The session was deleted successfully.",
+        responses={
+            500: {"description": "Internal server error."},
+        },
+    )
     async def delete_session(
-        app_name: str, user_id: str, session_id: str
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID to delete.",
+            examples=["session-abc123"],
+        ),
     ) -> None:
+      """Delete a session for a user in an application.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Unique identifier of the session to delete.
+
+      **Returns**
+      - `None`
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       await self.session_service.delete_session(
           app_name=app_name, user_id=user_id, session_id=session_id
       )
@@ -1160,26 +1484,51 @@ class AdkWebServer:
     @app.patch(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
         response_model_exclude_none=True,
+        summary="Update session state",
+        response_description=(
+            "The updated session after applying the provided state delta."
+        ),
+        responses={
+            404: {"description": "Session not found."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def update_session(
-        app_name: str,
-        user_id: str,
-        session_id: str,
+        *,
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID to update.",
+            examples=["session-abc123"],
+        ),
         req: UpdateSessionRequest,
     ) -> Session:
-      """Updates session state without running the agent.
+      """Update session state without running the agent.
 
-      Args:
-          app_name: The name of the application.
-          user_id: The ID of the user.
-          session_id: The ID of the session to update.
-          req: The patch request containing state changes.
+      This applies `req.state_delta` by appending a state-delta event to the
+      session. The session's persisted `state` is updated by the session
+      service based on appended events.
 
-      Returns:
-          The updated session.
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Unique identifier of the session to update.
 
-      Raises:
-          HTTPException: If the session is not found.
+      **Request body**
+      - `req.state_delta`: Key-value state changes to merge into session state.
+
+      **Returns**
+      - `Session`: The updated session.
+
+      **Errors**
+      - `404 Not Found`: No session exists with the given ID.
+      - `500 Internal Server Error`: Unexpected internal error.
       """
       session = await self.session_service.get_session(
           app_name=app_name, user_id=user_id, session_id=session_id
@@ -1608,14 +1957,60 @@ class AdkWebServer:
     @app.get(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}",
         response_model_exclude_none=True,
+        summary="Load an artifact",
+        response_description=(
+            "The requested artifact payload for the latest or specified"
+            " version."
+        ),
+        responses={
+            404: {"description": "Artifact not found."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def load_artifact(
-        app_name: str,
-        user_id: str,
-        session_id: str,
-        artifact_name: str,
-        version: Optional[int] = Query(None),
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID that owns the artifact.",
+            examples=["session-abc123"],
+        ),
+        artifact_name: str = Path(
+            description="Artifact filename to load.",
+            examples=["report.txt"],
+        ),
+        version: Optional[int] = Query(
+            default=None,
+            description=(
+                "Optional artifact version to load. If omitted, the latest"
+                " version is returned."
+            ),
+            examples=[3],
+        ),
     ) -> Optional[types.Part]:
+      """Load an artifact from a session.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Session ID that owns the artifact.
+      - `artifact_name`: Artifact filename to load.
+
+      **Query parameters**
+      - `version` (optional): Artifact version to load. Defaults to latest.
+
+      **Returns**
+      - `types.Part`: The artifact payload.
+
+      **Errors**
+      - `404 Not Found`: Artifact not found.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       artifact = await self.artifact_service.load_artifact(
           app_name=app_name,
           user_id=user_id,
@@ -1631,13 +2026,46 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}/versions/metadata",
         response_model=list[ArtifactVersion],
         response_model_exclude_none=True,
+        summary="List artifact version metadata",
+        response_description=(
+            "Metadata for every stored version of the specified artifact."
+        ),
+        responses={
+            500: {"description": "Internal server error."},
+        },
     )
     async def list_artifact_versions_metadata(
-        app_name: str,
-        user_id: str,
-        session_id: str,
-        artifact_name: str,
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID that owns the artifact.",
+            examples=["session-abc123"],
+        ),
+        artifact_name: str = Path(
+            description="Artifact filename whose versions are listed.",
+            examples=["report.txt"],
+        ),
     ) -> list[ArtifactVersion]:
+      """List metadata for all stored versions of an artifact.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Session ID that owns the artifact.
+      - `artifact_name`: Artifact filename whose versions are listed.
+
+      **Returns**
+      - `list[ArtifactVersion]`: Metadata entries for all stored versions.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       return await self.artifact_service.list_artifact_versions(
           app_name=app_name,
           user_id=user_id,
@@ -1648,14 +2076,53 @@ class AdkWebServer:
     @app.get(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}/versions/{version_id}",
         response_model_exclude_none=True,
+        summary="Load a specific artifact version",
+        response_description=(
+            "The artifact payload for the requested version."
+        ),
+        responses={
+            404: {"description": "Artifact not found."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def load_artifact_version(
-        app_name: str,
-        user_id: str,
-        session_id: str,
-        artifact_name: str,
-        version_id: int,
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID that owns the artifact.",
+            examples=["session-abc123"],
+        ),
+        artifact_name: str = Path(
+            description="Artifact filename to load.",
+            examples=["report.txt"],
+        ),
+        version_id: int = Path(
+            description="Artifact version number to load.",
+            examples=[3],
+        ),
     ) -> Optional[types.Part]:
+      """Load a specific stored version of an artifact.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Session ID that owns the artifact.
+      - `artifact_name`: Artifact filename to load.
+      - `version_id`: Artifact version number to load.
+
+      **Returns**
+      - `types.Part`: The artifact payload.
+
+      **Errors**
+      - `404 Not Found`: Artifact not found.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       artifact = await self.artifact_service.load_artifact(
           app_name=app_name,
           user_id=user_id,
@@ -1671,13 +2138,50 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts",
         response_model=ArtifactVersion,
         response_model_exclude_none=True,
+        summary="Save an artifact",
+        response_description=(
+            "Metadata for the newly created artifact version."
+        ),
+        responses={
+            400: {"description": "Invalid artifact payload."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def save_artifact(
-        app_name: str,
-        user_id: str,
-        session_id: str,
+        *,
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID that will own the saved artifact.",
+            examples=["session-abc123"],
+        ),
         req: SaveArtifactRequest,
     ) -> ArtifactVersion:
+      """Save a new artifact version in a session.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Session ID that will own the saved artifact.
+
+      **Request body**
+      - `req.filename`: Artifact filename.
+      - `req.artifact`: Artifact payload as `google.genai.types.Part`.
+      - `req.custom_metadata` (optional): Metadata attached to the version.
+
+      **Returns**
+      - `ArtifactVersion`: Metadata for the newly created artifact version.
+
+      **Errors**
+      - `400 Bad Request`: Invalid artifact payload.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       try:
         version = await self.artifact_service.save_artifact(
             app_name=app_name,
@@ -1718,14 +2222,53 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}/versions/{version_id}/metadata",
         response_model=ArtifactVersion,
         response_model_exclude_none=True,
+        summary="Get artifact version metadata",
+        response_description=(
+            "Metadata for the requested artifact version."
+        ),
+        responses={
+            404: {"description": "Artifact version not found."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def get_artifact_version_metadata(
-        app_name: str,
-        user_id: str,
-        session_id: str,
-        artifact_name: str,
-        version_id: int,
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID that owns the artifact.",
+            examples=["session-abc123"],
+        ),
+        artifact_name: str = Path(
+            description="Artifact filename whose metadata is retrieved.",
+            examples=["report.txt"],
+        ),
+        version_id: int = Path(
+            description="Artifact version number whose metadata is retrieved.",
+            examples=[3],
+        ),
     ) -> ArtifactVersion:
+      """Get metadata for a specific artifact version.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Session ID that owns the artifact.
+      - `artifact_name`: Artifact filename.
+      - `version_id`: Artifact version number.
+
+      **Returns**
+      - `ArtifactVersion`: Metadata for the requested artifact version.
+
+      **Errors**
+      - `404 Not Found`: Artifact version not found.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       artifact_version = await self.artifact_service.get_artifact_version(
           app_name=app_name,
           user_id=user_id,
@@ -1742,10 +2285,41 @@ class AdkWebServer:
     @app.get(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts",
         response_model_exclude_none=True,
+        summary="List artifact names",
+        response_description=(
+            "All artifact names stored for the session."
+        ),
+        responses={
+            500: {"description": "Internal server error."},
+        },
     )
     async def list_artifact_names(
-        app_name: str, user_id: str, session_id: str
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID whose artifact names are listed.",
+            examples=["session-abc123"],
+        ),
     ) -> list[str]:
+      """List all artifact names stored in a session.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Session ID whose artifact names are listed.
+
+      **Returns**
+      - `list[str]`: Artifact filenames stored for the session.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       return await self.artifact_service.list_artifact_keys(
           app_name=app_name, user_id=user_id, session_id=session_id
       )
@@ -1753,10 +2327,46 @@ class AdkWebServer:
     @app.get(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}/versions",
         response_model_exclude_none=True,
+        summary="List artifact versions",
+        response_description=(
+            "Version numbers available for the specified artifact."
+        ),
+        responses={
+            500: {"description": "Internal server error."},
+        },
     )
     async def list_artifact_versions(
-        app_name: str, user_id: str, session_id: str, artifact_name: str
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID that owns the artifact.",
+            examples=["session-abc123"],
+        ),
+        artifact_name: str = Path(
+            description="Artifact filename whose versions are listed.",
+            examples=["report.txt"],
+        ),
     ) -> list[int]:
+      """List all stored version numbers for an artifact.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Session ID that owns the artifact.
+      - `artifact_name`: Artifact filename whose versions are listed.
+
+      **Returns**
+      - `list[int]`: Version numbers available for the artifact.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       return await self.artifact_service.list_versions(
           app_name=app_name,
           user_id=user_id,
@@ -1766,10 +2376,44 @@ class AdkWebServer:
 
     @app.delete(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}",
+        summary="Delete an artifact",
+        response_description="The artifact was deleted successfully.",
+        responses={
+            500: {"description": "Internal server error."},
+        },
     )
     async def delete_artifact(
-        app_name: str, user_id: str, session_id: str, artifact_name: str
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID that owns the artifact.",
+            examples=["session-abc123"],
+        ),
+        artifact_name: str = Path(
+            description="Artifact filename to delete.",
+            examples=["report.txt"],
+        ),
     ) -> None:
+      """Delete an artifact and all its stored versions from a session.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Session ID that owns the artifact.
+      - `artifact_name`: Artifact filename to delete.
+
+      **Returns**
+      - `None`
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       await self.artifact_service.delete_artifact(
           app_name=app_name,
           user_id=user_id,
@@ -1777,20 +2421,47 @@ class AdkWebServer:
           filename=artifact_name,
       )
 
-    @app.patch("/apps/{app_name}/users/{user_id}/memory")
+    @app.patch(
+        "/apps/{app_name}/users/{user_id}/memory",
+        summary="Add a session to memory",
+        response_description=(
+            "The session events were added to the configured memory service."
+        ),
+        responses={
+            400: {"description": "Memory service is not configured or request is invalid."},
+            404: {"description": "Session not found."},
+            500: {"description": "Internal server error."},
+        },
+    )
     async def patch_memory(
-        app_name: str, user_id: str, update_memory_request: UpdateMemoryRequest
+        *,
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        update_memory_request: UpdateMemoryRequest,
     ) -> None:
-      """Adds all events from a given session to the memory service.
+      """Add all events from a session to the configured memory service.
 
-      Args:
-          app_name: The name of the application.
-          user_id: The ID of the user.
-          update_memory_request: The memory request for the update
+      **Path parameters**
+      - `app_name`: Name of the application.
+      - `user_id`: ID of the user.
 
-      Raises:
-          HTTPException: If the memory service is not configured or the request
-          is invalid.
+      **Request body**
+      - `update_memory_request.session_id`: Session ID whose events are added
+        to memory.
+
+      **Returns**
+      - `None`
+
+      **Errors**
+      - `400 Bad Request`: Memory service not configured or request invalid.
+      - `404 Not Found`: Session not found.
+      - `500 Internal Server Error`: Unexpected internal error.
       """
       if not self.memory_service:
         raise HTTPException(
@@ -1813,8 +2484,46 @@ class AdkWebServer:
         raise HTTPException(status_code=404, detail="Session not found")
       await self.memory_service.add_session_to_memory(session)
 
-    @app.post("/run", response_model_exclude_none=True)
+    @app.post(
+        "/run",
+        response_model_exclude_none=True,
+        summary="Run an agent",
+        response_description=(
+            "Ordered events generated while processing the request."
+        ),
+        responses={
+            404: {"description": "Session not found."},
+            422: {"description": "Invalid request payload."},
+            500: {"description": "Internal server error."},
+        },
+    )
     async def run_agent(req: RunAgentRequest) -> list[Event]:
+      """Run an agent against a session and return all generated events.
+
+      This endpoint runs the app identified by `req.app_name` using the
+      provided session identifiers. Events are returned as a list after the
+      invocation finishes.
+
+      **Request body**
+      - `req.app_name`: Application name to run.
+      - `req.user_id`: User ID that owns the session.
+      - `req.session_id`: Session ID to run against.
+      - `req.new_message` (optional): New user message to append before
+        running. If provided without a role, it is treated as a user message.
+      - `req.state_delta` (optional): Session state changes to apply before
+        running.
+      - `req.invocation_id` (optional): Invocation ID to resume (resumable
+        apps only). Either `new_message` or `invocation_id` must be provided.
+
+      **Returns**
+      - `list[Event]`: Ordered events generated for the invocation.
+
+      **Errors**
+      - `404 Not Found`: Session not found when the runner is not configured
+        to auto-create sessions.
+      - `422 Unprocessable Entity`: Invalid request payload.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       runner = await self.get_runner_async(req.app_name)
       try:
         async with Aclosing(
@@ -1833,8 +2542,52 @@ class AdkWebServer:
       logger.debug("Events generated: %s", events)
       return events
 
-    @app.post("/run_sse")
+    @app.post(
+        "/run_sse",
+        summary="Run an agent with server-sent events",
+        response_description=(
+            "A text/event-stream response that emits events as they are"
+            " generated."
+        ),
+        responses={
+            404: {"description": "Session not found."},
+            422: {"description": "Invalid request payload."},
+            500: {"description": "Internal server error."},
+        },
+    )
     async def run_agent_sse(req: RunAgentRequest) -> StreamingResponse:
+      """Run an agent and stream generated events using server-sent events.
+
+      This endpoint streams events as they are generated using the
+      `text/event-stream` media type. Each SSE message is formatted as:
+      `data: <json>\n\n`, where `<json>` is an `Event` serialized with camelCase
+      field names.
+
+      **Request body**
+      - `req.app_name`: Application name to run.
+      - `req.user_id`: User ID that owns the session.
+      - `req.session_id`: Session ID to run against.
+      - `req.new_message` (optional): New user message to append before
+        running.
+      - `req.state_delta` (optional): Session state changes to apply before
+        running.
+      - `req.invocation_id` (optional): Invocation ID to resume (resumable
+        apps only).
+      - `req.streaming` (optional): Controls the runner streaming mode. The
+        response itself is always SSE.
+      - `req.function_call_event_id` (optional): When omitted, some artifact
+        updates may be split into two SSE events (content-only and action-only)
+        to match the ADK Web UI rendering behavior.
+
+      **Returns**
+      - `StreamingResponse`: SSE stream of `Event` payloads.
+
+      **Errors**
+      - `404 Not Found`: Session not found when the runner is not configured
+        to auto-create sessions.
+      - `422 Unprocessable Entity`: Invalid request payload.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       stream_mode = StreamingMode.SSE if req.streaming else StreamingMode.NONE
       runner = await self.get_runner_async(req.app_name)
 
@@ -1909,11 +2662,53 @@ class AdkWebServer:
     @app.get(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/events/{event_id}/graph",
         response_model_exclude_none=True,
+        summary="Get an event graph (debug)",
+        response_description=(
+            "Graphviz DOT source highlighting the agent/tool edge(s) inferred"
+            " from the specified event. Returns an empty object when the event"
+            " is not found."
+        ),
         tags=[TAG_DEBUG],
+        responses={
+            500: {"description": "Internal server error."},
+        },
     )
     async def get_event_graph(
-        app_name: str, user_id: str, session_id: str, event_id: str
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID that owns the event.",
+            examples=["session-abc123"],
+        ),
+        event_id: str = Path(
+            description="Event ID to visualize.",
+            examples=["event-123"],
+        ),
     ):
+      """Get a Graphviz DOT graph for a session event (debug endpoint).
+
+      This endpoint inspects the specified event and highlights agent-to-tool
+      (function call) and tool-to-agent (function response) edges in the agent
+      graph. If the event cannot be found, an empty object is returned.
+
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Session ID that owns the event.
+      - `event_id`: Event ID to visualize.
+
+      **Returns**
+      - `GetEventGraphResult`: Contains `dot_src` (Graphviz DOT source).
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       session = await self.session_service.get_session(
           app_name=app_name, user_id=user_id, session_id=session_id
       )
