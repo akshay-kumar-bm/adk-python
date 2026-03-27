@@ -1018,12 +1018,45 @@ class AdkWebServer:
         allowed_origin_regex=compiled_origin_regex,
     )
 
-    @app.get("/health")
+    @app.get(
+        "/health",
+        summary="Health check",
+        response_description="Basic liveness check for the API server.",
+        responses={
+            500: {"description": "Internal server error."},
+        },
+    )
     async def health() -> dict[str, str]:
+      """Check whether the API server is running.
+
+      **Returns**
+      - `dict[str, str]`: A small status payload.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       return {"status": "ok"}
 
-    @app.get("/version")
+    @app.get(
+        "/version",
+        summary="Get version information",
+        response_description="Version information for ADK and Python runtime.",
+        responses={
+            500: {"description": "Internal server error."},
+        },
+    )
     async def version() -> dict[str, str]:
+      """Return version information for the server runtime.
+
+      **Returns**
+      - `dict[str, str]`: Version metadata containing:
+        - `version`: ADK package version.
+        - `language`: Always `python`.
+        - `language_version`: Python runtime version.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       return {
           "version": __version__,
           "language": "python",
@@ -1032,12 +1065,35 @@ class AdkWebServer:
           ),
       }
 
-    @app.get("/list-apps")
+    @app.get(
+        "/list-apps",
+        response_model_exclude_none=True,
+        summary="List available apps",
+        response_description=(
+            "Either a list of app names, or detailed app information when"
+            " detailed=true."
+        ),
+        responses={
+            500: {"description": "Internal server error."},
+        },
+    )
     async def list_apps(
         detailed: bool = Query(
             default=False, description="Return detailed app information"
         )
     ) -> list[str] | ListAppsResponse:
+      """List the apps available to the server.
+
+      **Query parameters**
+      - `detailed` (optional): When true, returns structured app metadata.
+
+      **Returns**
+      - `list[str]`: App names when `detailed` is false.
+      - `ListAppsResponse`: App metadata when `detailed` is true.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       if detailed:
         apps_info = self.agent_loader.list_agents_detailed()
         return ListAppsResponse(apps=[AppInfo(**app) for app in apps_info])
@@ -2442,7 +2498,32 @@ class AdkWebServer:
         },
     )
     async def run_agent(req: RunAgentRequest) -> list[Event]:
-      """Run an agent against a session and return all generated events."""
+      """Run an agent against a session and return all generated events.
+
+      This endpoint runs the app identified by `req.app_name` using the
+      provided session identifiers. Events are returned as a list after the
+      invocation finishes.
+
+      **Request body**
+      - `req.app_name`: Application name to run.
+      - `req.user_id`: User ID that owns the session.
+      - `req.session_id`: Session ID to run against.
+      - `req.new_message` (optional): New user message to append before
+        running. If provided without a role, it is treated as a user message.
+      - `req.state_delta` (optional): Session state changes to apply before
+        running.
+      - `req.invocation_id` (optional): Invocation ID to resume (resumable
+        apps only). Either `new_message` or `invocation_id` must be provided.
+
+      **Returns**
+      - `list[Event]`: Ordered events generated for the invocation.
+
+      **Errors**
+      - `404 Not Found`: Session not found when the runner is not configured
+        to auto-create sessions.
+      - `422 Unprocessable Entity`: Invalid request payload.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       runner = await self.get_runner_async(req.app_name)
       try:
         async with Aclosing(
@@ -2475,7 +2556,38 @@ class AdkWebServer:
         },
     )
     async def run_agent_sse(req: RunAgentRequest) -> StreamingResponse:
-      """Run an agent and stream generated events using SSE."""
+      """Run an agent and stream generated events using server-sent events.
+
+      This endpoint streams events as they are generated using the
+      `text/event-stream` media type. Each SSE message is formatted as:
+      `data: <json>\n\n`, where `<json>` is an `Event` serialized with camelCase
+      field names.
+
+      **Request body**
+      - `req.app_name`: Application name to run.
+      - `req.user_id`: User ID that owns the session.
+      - `req.session_id`: Session ID to run against.
+      - `req.new_message` (optional): New user message to append before
+        running.
+      - `req.state_delta` (optional): Session state changes to apply before
+        running.
+      - `req.invocation_id` (optional): Invocation ID to resume (resumable
+        apps only).
+      - `req.streaming` (optional): Controls the runner streaming mode. The
+        response itself is always SSE.
+      - `req.function_call_event_id` (optional): When omitted, some artifact
+        updates may be split into two SSE events (content-only and action-only)
+        to match the ADK Web UI rendering behavior.
+
+      **Returns**
+      - `StreamingResponse`: SSE stream of `Event` payloads.
+
+      **Errors**
+      - `404 Not Found`: Session not found when the runner is not configured
+        to auto-create sessions.
+      - `422 Unprocessable Entity`: Invalid request payload.
+      - `500 Internal Server Error`: Unexpected internal error.
+      """
       stream_mode = StreamingMode.SSE if req.streaming else StreamingMode.NONE
       runner = await self.get_runner_async(req.app_name)
 
