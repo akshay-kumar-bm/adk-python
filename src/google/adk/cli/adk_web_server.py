@@ -33,6 +33,7 @@ from typing import Optional
 
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi import Path
 from fastapi import Query
 from fastapi import Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -392,7 +393,11 @@ class CreateSessionRequest(common.BaseModel):
   )
   events: Optional[list[Event]] = Field(
       default=None,
-      description="A list of events to initialize the session with.",
+      description=(
+          "Optional list of events to seed the session history. Events are"
+          " appended in order after session creation."
+      ),
+      examples=[[]],
   )
 
 
@@ -1089,25 +1094,41 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
         response_model_exclude_none=True,
         summary="Get a session",
+        responses={
+            404: {"description": "Session not found."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def get_session(
-        app_name: str, user_id: str, session_id: str
+        app_name: str = Path(
+            description="Application name that owns the session.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID that owns the session.",
+            examples=["user-123"],
+        ),
+        session_id: str = Path(
+            description="Session ID to retrieve.",
+            examples=["session-abc123"],
+        ),
     ) -> Session:
-      """Retrieves a specific session by its ID.
+      """Retrieve a specific session by ID.
 
-      Returns the full session object including conversation history and state
-      for the given application, user, and session ID combination.
+      Returns the full session object, including conversation history and
+      state, for the given application, user, and session ID.
 
-      Args:
-          app_name: The name of the application that owns the session.
-          user_id: The ID of the user who owns the session.
-          session_id: The unique identifier of the session to retrieve.
+      **Path parameters**
+      - `app_name`: Name of the application that owns the session.
+      - `user_id`: ID of the user who owns the session.
+      - `session_id`: Unique identifier of the session to retrieve.
 
-      Returns:
-          The session object containing conversation events and state.
+      **Returns**
+      - `Session`: Session object containing conversation events and state.
 
-      Raises:
-          HTTPException: 404 if no session with the given ID exists.
+      **Errors**
+      - `404 Not Found`: No session exists with the given ID.
+      - `500 Internal Server Error`: Unexpected internal error.
       """
       session = await self.session_service.get_session(
           app_name=app_name, user_id=user_id, session_id=session_id
@@ -1121,20 +1142,35 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions",
         response_model_exclude_none=True,
         summary="List sessions",
+        responses={
+            500: {"description": "Internal server error."},
+        },
     )
-    async def list_sessions(app_name: str, user_id: str) -> list[Session]:
-      """Lists all active sessions for the specified user and application.
+    async def list_sessions(
+        app_name: str = Path(
+            description="Application name to list sessions from.",
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID whose sessions are listed.",
+            examples=["user-123"],
+        ),
+    ) -> list[Session]:
+      """List sessions for a user in an application.
 
-      Returns all sessions belonging to the user within the given application,
-      excluding internal sessions generated during evaluation runs.
+      Returns all sessions for the given application and user, excluding
+      internal sessions generated during evaluation runs.
 
-      Args:
-          app_name: The name of the application.
-          user_id: The ID of the user whose sessions to list.
+      **Path parameters**
+      - `app_name`: Name of the application.
+      - `user_id`: ID of the user whose sessions are listed.
 
-      Returns:
-          A list of session objects. Returns an empty list if the user has no
-          sessions.
+      **Returns**
+      - `list[Session]`: List of sessions. Returns an empty list when none
+        exist.
+
+      **Errors**
+      - `500 Internal Server Error`: Unexpected internal error.
       """
       list_sessions_response = await self.session_service.list_sessions(
           app_name=app_name, user_id=user_id
@@ -1171,30 +1207,45 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions",
         response_model_exclude_none=True,
         summary="Create a session",
+        responses={
+            409: {"description": "Session already exists."},
+            500: {"description": "Internal server error."},
+        },
     )
     async def create_session(
-        app_name: str,
-        user_id: str,
+        app_name: str = Path(
+            description=(
+                "Application name under which the session is created."
+            ),
+            examples=["hello_world"],
+        ),
+        user_id: str = Path(
+            description="User ID for whom the session is created.",
+            examples=["user-123"],
+        ),
         req: Optional[CreateSessionRequest] = None,
     ) -> Session:
-      """Creates a new session for the specified user and application.
+      """Create a new session for a user in an application.
 
-      A session stores conversation history and state across multiple agent
-      interactions. If no session ID is provided, a random unique ID is
-      generated automatically. An optional initial state and seed events can
-      be supplied to pre-populate the session.
+      A session stores conversation history and state across agent
+      interactions. If `req.session_id` is omitted, a random session ID is
+      generated automatically.
 
-      Args:
-          app_name: The name of the application to create the session under.
-          user_id: The ID of the user for whom the session is created.
-          req: Optional request body with session configuration, including an
-              optional session ID, initial state dictionary, and seed events.
+      **Path parameters**
+      - `app_name`: Name of the application where the session is created.
+      - `user_id`: ID of the user for whom the session is created.
 
-      Returns:
-          The newly created session object.
+      **Request body**
+      - `req.session_id` (optional): Explicit session ID.
+      - `req.state` (optional): Initial session state.
+      - `req.events` (optional): Seed events appended after creation.
 
-      Raises:
-          HTTPException: 409 if a session with the given ID already exists.
+      **Returns**
+      - `Session`: Newly created session object.
+
+      **Errors**
+      - `409 Conflict`: Session with the same ID already exists.
+      - `500 Internal Server Error`: Unexpected internal error.
       """
       if not req:
         return await self._create_session(app_name=app_name, user_id=user_id)
