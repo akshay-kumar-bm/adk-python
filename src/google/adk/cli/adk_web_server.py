@@ -368,15 +368,27 @@ class RunAgentRequest(common.BaseModel):
 
 
 class CreateSessionRequest(common.BaseModel):
+  """Request payload for creating a new session.
+
+  Attributes:
+      session_id: The ID of the session to create. If omitted, a random ID is
+          generated automatically.
+      state: An optional key-value mapping used as the session's initial state.
+      events: An optional list of events to seed the session history with.
+  """
+
   session_id: Optional[str] = Field(
       default=None,
       description=(
           "The ID of the session to create. If not provided, a random session"
           " ID will be generated."
       ),
+      examples=["session-abc123"],
   )
   state: Optional[dict[str, Any]] = Field(
-      default=None, description="The initial state of the session."
+      default=None,
+      description="The initial state of the session.",
+      examples=[{"user_preferences": {"language": "en"}}],
   )
   events: Optional[list[Event]] = Field(
       default=None,
@@ -1076,10 +1088,27 @@ class AdkWebServer:
     @app.get(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
         response_model_exclude_none=True,
+        summary="Get a session",
     )
     async def get_session(
         app_name: str, user_id: str, session_id: str
     ) -> Session:
+      """Retrieves a specific session by its ID.
+
+      Returns the full session object including conversation history and state
+      for the given application, user, and session ID combination.
+
+      Args:
+          app_name: The name of the application that owns the session.
+          user_id: The ID of the user who owns the session.
+          session_id: The unique identifier of the session to retrieve.
+
+      Returns:
+          The session object containing conversation events and state.
+
+      Raises:
+          HTTPException: 404 if no session with the given ID exists.
+      """
       session = await self.session_service.get_session(
           app_name=app_name, user_id=user_id, session_id=session_id
       )
@@ -1091,8 +1120,22 @@ class AdkWebServer:
     @app.get(
         "/apps/{app_name}/users/{user_id}/sessions",
         response_model_exclude_none=True,
+        summary="List sessions",
     )
     async def list_sessions(app_name: str, user_id: str) -> list[Session]:
+      """Lists all active sessions for the specified user and application.
+
+      Returns all sessions belonging to the user within the given application,
+      excluding internal sessions generated during evaluation runs.
+
+      Args:
+          app_name: The name of the application.
+          user_id: The ID of the user whose sessions to list.
+
+      Returns:
+          A list of session objects. Returns an empty list if the user has no
+          sessions.
+      """
       list_sessions_response = await self.session_service.list_sessions(
           app_name=app_name, user_id=user_id
       )
@@ -1127,12 +1170,32 @@ class AdkWebServer:
     @app.post(
         "/apps/{app_name}/users/{user_id}/sessions",
         response_model_exclude_none=True,
+        summary="Create a session",
     )
     async def create_session(
         app_name: str,
         user_id: str,
         req: Optional[CreateSessionRequest] = None,
     ) -> Session:
+      """Creates a new session for the specified user and application.
+
+      A session stores conversation history and state across multiple agent
+      interactions. If no session ID is provided, a random unique ID is
+      generated automatically. An optional initial state and seed events can
+      be supplied to pre-populate the session.
+
+      Args:
+          app_name: The name of the application to create the session under.
+          user_id: The ID of the user for whom the session is created.
+          req: Optional request body with session configuration, including an
+              optional session ID, initial state dictionary, and seed events.
+
+      Returns:
+          The newly created session object.
+
+      Raises:
+          HTTPException: 409 if a session with the given ID already exists.
+      """
       if not req:
         return await self._create_session(app_name=app_name, user_id=user_id)
 
