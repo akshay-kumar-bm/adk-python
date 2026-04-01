@@ -31,8 +31,8 @@ from typing import List
 from typing import Literal
 from typing import Optional
 
-from fastapi import FastAPI
 from fastapi import Body
+from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Path
 from fastapi import Query
@@ -109,6 +109,10 @@ _EVAL_SET_FILE_EXTENSION = ".evalset.json"
 
 TAG_DEBUG = "Debug"
 TAG_EVALUATION = "Evaluation"
+TAG_SESSIONS = "Sessions"
+TAG_RUNS = "Agent Runs"
+TAG_ARTIFACTS = "Artifacts"
+TAG_MEMORY = "Memory"
 
 _REGEX_PREFIX = "regex:"
 
@@ -380,12 +384,10 @@ class RunAgentRequest(common.BaseModel):
           "Optional user message to append before the run starts. Either"
           " new_message or invocation_id is required for a run."
       ),
-      examples=[
-          {
-              "role": "user",
-              "parts": [{"text": "Summarize the last response."}],
-          }
-      ],
+      examples=[{
+          "role": "user",
+          "parts": [{"text": "Summarize the last response."}],
+      }],
   )
   streaming: bool = Field(
       default=False,
@@ -1216,9 +1218,9 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
         response_model_exclude_none=True,
         summary="Get a session",
+        tags=[TAG_SESSIONS],
         response_description=(
-            "The stored session, including its current state and event"
-            " history."
+            "The stored session, including its current state and event history."
         ),
         responses={
             404: {"description": "Session not found."},
@@ -1268,6 +1270,7 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions",
         response_model_exclude_none=True,
         summary="List sessions",
+        tags=[TAG_SESSIONS],
         response_description=(
             "All non-evaluation sessions for the specified application and"
             " user."
@@ -1320,6 +1323,7 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
         response_model_exclude_none=True,
         summary="Create a session (deprecated)",
+        tags=[TAG_SESSIONS],
         response_description="The newly created session.",
         responses={
             409: {"description": "Session already exists."},
@@ -1328,9 +1332,7 @@ class AdkWebServer:
     )
     async def create_session_with_id(
         app_name: str = Path(
-            description=(
-                "Application name under which the session is created."
-            ),
+            description="Application name under which the session is created.",
             examples=["hello_world"],
         ),
         user_id: str = Path(
@@ -1382,6 +1384,7 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions",
         response_model_exclude_none=True,
         summary="Create a session",
+        tags=[TAG_SESSIONS],
         response_description=(
             "The newly created session with its initial state and any seeded"
             " events."
@@ -1393,9 +1396,7 @@ class AdkWebServer:
     )
     async def create_session(
         app_name: str = Path(
-            description=(
-                "Application name under which the session is created."
-            ),
+            description="Application name under which the session is created.",
             examples=["hello_world"],
         ),
         user_id: str = Path(
@@ -1445,6 +1446,7 @@ class AdkWebServer:
     @app.delete(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
         summary="Delete a session",
+        tags=[TAG_SESSIONS],
         response_description="The session was deleted successfully.",
         responses={
             500: {"description": "Internal server error."},
@@ -1485,6 +1487,7 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}",
         response_model_exclude_none=True,
         summary="Update session state",
+        tags=[TAG_SESSIONS],
         response_description=(
             "The updated session after applying the provided state delta."
         ),
@@ -1958,6 +1961,7 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}",
         response_model_exclude_none=True,
         summary="Load an artifact",
+        tags=[TAG_ARTIFACTS],
         response_description=(
             "The requested artifact payload for the latest or specified"
             " version."
@@ -2027,6 +2031,7 @@ class AdkWebServer:
         response_model=list[ArtifactVersion],
         response_model_exclude_none=True,
         summary="List artifact version metadata",
+        tags=[TAG_ARTIFACTS],
         response_description=(
             "Metadata for every stored version of the specified artifact."
         ),
@@ -2077,9 +2082,8 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}/versions/{version_id}",
         response_model_exclude_none=True,
         summary="Load a specific artifact version",
-        response_description=(
-            "The artifact payload for the requested version."
-        ),
+        tags=[TAG_ARTIFACTS],
+        response_description="The artifact payload for the requested version.",
         responses={
             404: {"description": "Artifact not found."},
             500: {"description": "Internal server error."},
@@ -2139,9 +2143,8 @@ class AdkWebServer:
         response_model=ArtifactVersion,
         response_model_exclude_none=True,
         summary="Save an artifact",
-        response_description=(
-            "Metadata for the newly created artifact version."
-        ),
+        tags=[TAG_ARTIFACTS],
+        response_description="Metadata for the newly created artifact version.",
         responses={
             400: {"description": "Invalid artifact payload."},
             500: {"description": "Internal server error."},
@@ -2223,9 +2226,8 @@ class AdkWebServer:
         response_model=ArtifactVersion,
         response_model_exclude_none=True,
         summary="Get artifact version metadata",
-        response_description=(
-            "Metadata for the requested artifact version."
-        ),
+        tags=[TAG_ARTIFACTS],
+        response_description="Metadata for the requested artifact version.",
         responses={
             404: {"description": "Artifact version not found."},
             500: {"description": "Internal server error."},
@@ -2286,9 +2288,8 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts",
         response_model_exclude_none=True,
         summary="List artifact names",
-        response_description=(
-            "All artifact names stored for the session."
-        ),
+        tags=[TAG_ARTIFACTS],
+        response_description="All artifact names stored for the session.",
         responses={
             500: {"description": "Internal server error."},
         },
@@ -2328,6 +2329,7 @@ class AdkWebServer:
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}/versions",
         response_model_exclude_none=True,
         summary="List artifact versions",
+        tags=[TAG_ARTIFACTS],
         response_description=(
             "Version numbers available for the specified artifact."
         ),
@@ -2377,6 +2379,7 @@ class AdkWebServer:
     @app.delete(
         "/apps/{app_name}/users/{user_id}/sessions/{session_id}/artifacts/{artifact_name}",
         summary="Delete an artifact",
+        tags=[TAG_ARTIFACTS],
         response_description="The artifact was deleted successfully.",
         responses={
             500: {"description": "Internal server error."},
@@ -2424,11 +2427,16 @@ class AdkWebServer:
     @app.patch(
         "/apps/{app_name}/users/{user_id}/memory",
         summary="Add a session to memory",
+        tags=[TAG_MEMORY],
         response_description=(
             "The session events were added to the configured memory service."
         ),
         responses={
-            400: {"description": "Memory service is not configured or request is invalid."},
+            400: {
+                "description": (
+                    "Memory service is not configured or request is invalid."
+                )
+            },
             404: {"description": "Session not found."},
             500: {"description": "Internal server error."},
         },
@@ -2488,6 +2496,7 @@ class AdkWebServer:
         "/run",
         response_model_exclude_none=True,
         summary="Run an agent",
+        tags=[TAG_RUNS],
         response_description=(
             "Ordered events generated while processing the request."
         ),
@@ -2545,6 +2554,7 @@ class AdkWebServer:
     @app.post(
         "/run_sse",
         summary="Run an agent with server-sent events",
+        tags=[TAG_RUNS],
         response_description=(
             "A text/event-stream response that emits events as they are"
             " generated."
@@ -2560,8 +2570,8 @@ class AdkWebServer:
 
       This endpoint streams events as they are generated using the
       `text/event-stream` media type. Each SSE message is formatted as:
-      `data: <json>\n\n`, where `<json>` is an `Event` serialized with camelCase
-      field names.
+      `data: {"key":"value"}`, where the JSON object is an `Event`
+      serialized with camelCase field names.
 
       **Request body**
       - `req.app_name`: Application name to run.
